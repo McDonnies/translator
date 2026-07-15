@@ -10,7 +10,9 @@
   input,select{width:100%;box-sizing:border-box;padding:10px;margin:4px 0;border-radius:8px;border:1px solid #444;background:#1c1c1c;color:#eee;font-size:14px}
   button{width:100%;padding:14px;margin-top:10px;border:none;border-radius:10px;font-size:17px;font-weight:600}
   #startBtn{background:#2e7d32;color:#fff}
-  #stopBtn{background:#b71c1c;color:#fff;display:none}
+  #runRow{display:none;gap:8px}
+  #pauseBtn{background:#f9a825;color:#111}
+  #stopBtn{background:#b71c1c;color:#fff}
   #dlBtn,#testBtn{background:#333;color:#eee;font-size:14px;padding:10px}
   #status{margin:10px 0;font-size:13px;color:#9e9e9e;white-space:pre-line}
   #interim{color:#80cbc4;font-style:italic;min-height:1.4em;font-size:15px}
@@ -35,17 +37,20 @@
   <input id="oaKey" placeholder="OpenAI API key (sk-...) — обязателен для Realtime" autocomplete="off">
   <input id="tgToken" placeholder="Telegram bot token (123456:ABC...)" autocomplete="off">
   <input id="tgChat" placeholder="Telegram chat id (-100...)" autocomplete="off">
-  <label class="chk"><input type="checkbox" id="playAudio" checked> 🔊 Озвучивать перевод — только в наушнике, иначе микрофон услышит сам себя</label>
+  <label class="chk"><input type="checkbox" id="sendVoice" checked> 🎙 Слать в Telegram ещё и голосом (voice-сообщения, только в Realtime)</label>
   <button id="testBtn">Проверить связь (пришлёт тест в телегу)</button>
 </details>
 
 <button id="startBtn">▶ Начать перевод</button>
-<button id="stopBtn">■ Остановить</button>
+<div id="runRow">
+  <button id="pauseBtn">⏸ Пауза</button>
+  <button id="stopBtn">■ Стоп</button>
+</div>
 <div id="status">Ожидание…</div>
 <div id="interim"></div>
 <div id="log"></div>
 <button id="dlBtn">⬇ Скачать транскрипт</button>
-<audio id="ttsOut" autoplay playsinline></audio>
+<audio id="ttsOut" autoplay playsinline muted></audio>
 
 <script>
 const $ = id => document.getElementById(id);
@@ -58,24 +63,28 @@ const PRICE_PER_MIN = 0.034; // $ за минуту gpt-realtime-translate
   el.addEventListener("input", () => localStorage.setItem(f, el.value.trim()));
   el.addEventListener("change", () => localStorage.setItem(f, el.value));
 });
-$("playAudio").checked = localStorage.getItem("playAudio") !== "0";
-$("playAudio").addEventListener("change", () => {
-  localStorage.setItem("playAudio", $("playAudio").checked ? "1" : "0");
-  $("ttsOut").muted = !$("playAudio").checked;
-});
+$("sendVoice").checked = localStorage.getItem("sendVoice") !== "0";
+$("sendVoice").addEventListener("change", () =>
+  localStorage.setItem("sendVoice", $("sendVoice").checked ? "1" : "0"));
 
-let running = false, rec = null, wakeLock = null;
+let running = false, paused = false, rec = null, wakeLock = null;
 let transcript = [];
 let restartCount = 0;
 let currentMode = "realtime";
-let sessionStart = 0, costTimer = null;
+let sessionStart = 0, activeMs = 0, costTimer = null;
 
 function setStatus(t){ $("status").textContent = t; }
-function tickStatus(){
-  if(!running || currentMode !== "realtime") return;
-  const s = Math.floor((Date.now() - sessionStart) / 1000);
+function activeSeconds(){
+  return Math.floor((activeMs + (running && !paused ? Date.now() - sessionStart : 0)) / 1000);
+}
+function costStr(){
+  const s = activeSeconds();
   const mm = String(Math.floor(s/60)).padStart(2,"0"), ss = String(s%60).padStart(2,"0");
-  setStatus(`Слушаю (Realtime)… ${mm}:${ss} · ≈$${(s/60*PRICE_PER_MIN).toFixed(2)} · переподключений: ${restartCount}`);
+  return `${mm}:${ss} · ≈$${(s/60*PRICE_PER_MIN).toFixed(2)}`;
+}
+function tickStatus(){
+  if(!running || paused || currentMode !== "realtime") return;
+  setStatus(`Слушаю (Realtime)… ${costStr()} · переподключений: ${restartCount}`);
 }
 
 async function requestLock(){
@@ -141,6 +150,79 @@ function pushSegment(fr, ru){
   pumpTG();
 }
 
+/* ---------- Голос перевода → Telegram voice ---------- */
+// пишем переведённую озвучку кусками (детектор тишины) и шлём войсами
+let vadTimer = null, vadRecorder = null, audioCtx = null, vadSrc = null;
+let voiceAsDoc = false; // если TG не принял формат как voice — шлём файлом
+
+async function sendVoiceTG(blob, mime){
+  const token = $("tgToken").value.trim(), chat = $("tgChat").value.trim();
+  if(!token || !chat) return;
+  const ext = mime.includes("mp4") ? "m4a" : mime.includes("webm") ? "webm" : "ogg";
+  const attempt = async (asDoc) => {
+    const fd = new FormData();
+    fd.append("chat_id", chat);
+    // webm-opus пробуем отдать как voice.ogg — внутри тот же opus, TG обычно принимает
+    fd.append(asDoc ? "document" : "voice",
+      new File([blob], asDoc ? ("perevod." + ext) : ("voice." + (ext === "webm" ? "ogg" : ext)), {type: mime}));
+    const r = await fetch(`https://api.telegram.org/bot${token}/${asDoc ? "sendDocument" : "sendVoice"}`,
+      {method: "POST", body: fd});
+    return r.ok;
+  };
+  try{
+    if(!voiceAsDoc && await attempt(false)) return;
+    voiceAsDoc = true;
+    await attempt(true);
+  }catch(e){}
+}
+
+function watchRemoteAudio(stream){
+  stopVoiceWatch();
+  if(!window.MediaRecorder) return;
+  const mime = ["audio/ogg;codecs=opus","audio/mp4","audio/webm;codecs=opus"]
+    .find(m => MediaRecorder.isTypeSupported(m));
+  if(!mime) return;
+  audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+  audioCtx.resume().catch(()=>{});
+  vadSrc = audioCtx.createMediaStreamSource(stream);
+  const an = audioCtx.createAnalyser();
+  an.fftSize = 2048;
+  vadSrc.connect(an);
+  const buf = new Float32Array(an.fftSize);
+  let silentMs = 0;
+  vadTimer = setInterval(() => {
+    if(!running || paused) return;
+    an.getFloatTimeDomainData(buf);
+    let rms = 0;
+    for(let i = 0; i < buf.length; i++) rms += buf[i]*buf[i];
+    rms = Math.sqrt(rms / buf.length);
+    if(rms > 0.01){ // озвучка говорит
+      silentMs = 0;
+      if($("sendVoice").checked && !vadRecorder){
+        vadRecorder = new MediaRecorder(stream, {mimeType: mime});
+        const chunks = [];
+        vadRecorder.ondataavailable = e => { if(e.data.size) chunks.push(e.data); };
+        vadRecorder.onstop = () => {
+          const b = new Blob(chunks, {type: mime});
+          vadRecorder = null;
+          if(b.size > 4000) sendVoiceTG(b, mime); // совсем короткие огрызки не шлём
+        };
+        vadRecorder.start();
+      }
+    } else {
+      silentMs += 100;
+      if(vadRecorder && silentMs >= 1000){
+        try{ vadRecorder.stop(); }catch(e){ vadRecorder = null; }
+      }
+    }
+  }, 100);
+}
+function stopVoiceWatch(){
+  clearInterval(vadTimer); vadTimer = null;
+  if(vadRecorder){ try{ vadRecorder.stop(); }catch(e){} vadRecorder = null; }
+  if(vadSrc){ try{ vadSrc.disconnect(); }catch(e){} vadSrc = null; }
+}
+
 /* ---------- Realtime-режим: gpt-realtime-translate по WebRTC ---------- */
 let pc = null, dc = null, mediaStream = null;
 let refreshTimer = null, flushTimer = null;
@@ -164,15 +246,13 @@ async function startRealtime(){
   pc = new RTCPeerConnection();
   mediaStream.getAudioTracks().forEach(t => pc.addTrack(t, mediaStream));
   pc.ontrack = ({streams}) => {
-    const a = $("ttsOut");
-    a.srcObject = streams[0];
-    a.muted = !$("playAudio").checked;
-    a.play().catch(()=>{});
+    $("ttsOut").srcObject = streams[0]; // локально не звучит (muted), но держит поток живым
+    watchRemoteAudio(streams[0]);       // отсюда пишем войсы для телеги
   };
   dc = pc.createDataChannel("oai-events");
   dc.onmessage = onRealtimeEvent;
   pc.onconnectionstatechange = () => {
-    if(running && (pc.connectionState === "failed" || pc.connectionState === "disconnected")){
+    if(running && !paused && (pc.connectionState === "failed" || pc.connectionState === "disconnected")){
       setStatus("Связь оборвалась — переподключаюсь…");
       scheduleRestart();
     }
@@ -192,13 +272,14 @@ async function startRealtime(){
   // у realtime-сессий есть лимит длительности — плановый перезапуск раньше, чем нас отрежут
   clearTimeout(refreshTimer);
   refreshTimer = setTimeout(() => {
-    if(running){ setStatus("Плановое обновление сессии…"); scheduleRestart(); }
+    if(running && !paused){ setStatus("Плановое обновление сессии…"); scheduleRestart(); }
   }, 25 * 60 * 1000);
 }
 
 function teardownRT(keepMic){
   clearTimeout(refreshTimer);
   flushSegment();
+  stopVoiceWatch();
   try{ dc && dc.close(); }catch(e){}
   try{ pc && pc.close(); }catch(e){}
   dc = pc = null;
@@ -206,14 +287,14 @@ function teardownRT(keepMic){
 }
 
 function scheduleRestart(){
-  if(restarting || !running) return;
+  if(restarting || !running || paused) return;
   restarting = true;
   teardownRT(true); // микрофон не отпускаем, чтобы не потерять разрешение
   restartCount++;
   const delay = Math.min(15000, 1000 * Math.pow(2, failStreak));
   setTimeout(async () => {
     restarting = false;
-    if(!running) return;
+    if(!running || paused) return;
     try{ await startRealtime(); }
     catch(e){
       failStreak++;
@@ -314,7 +395,7 @@ function makeRec(){
     $("interim").textContent = interim;
   };
   r.onend = () => {           // Chrome на Android периодически сам останавливается — перезапускаем
-    if(running){
+    if(running && !paused){
       restartCount++;
       setStatus(`Слушаю (бесплатный режим)… перезапусков: ${restartCount}`);
       try{ r.start(); }catch(e){ setTimeout(()=>{ try{r.start()}catch(_){} }, 500); }
@@ -324,8 +405,7 @@ function makeRec(){
     if(e.error === "not-allowed"){
       setStatus("Нет доступа к микрофону! Разреши в настройках сайта.");
       running = false;
-      $("startBtn").style.display = "block";
-      $("stopBtn").style.display = "none";
+      showIdleButtons();
     }
     // остальные ошибки (no-speech, network) — onend сам перезапустит
   };
@@ -333,6 +413,16 @@ function makeRec(){
 }
 
 /* ---------- Управление ---------- */
+function showRunButtons(){
+  $("startBtn").style.display = "none";
+  $("runRow").style.display = "flex";
+}
+function showIdleButtons(){
+  $("startBtn").style.display = "block";
+  $("runRow").style.display = "none";
+  $("pauseBtn").textContent = "⏸ Пауза";
+}
+
 $("startBtn").onclick = async () => {
   currentMode = $("mode").value;
   if(currentMode === "realtime" && !$("oaKey").value.trim()){
@@ -341,7 +431,9 @@ $("startBtn").onclick = async () => {
   if((!$("tgToken").value.trim() || !$("tgChat").value.trim()) &&
      !confirm("Telegram не настроен — перевод будет только на экране. Продолжить?")) return;
 
-  running = true; restartCount = 0; failStreak = 0; sessionStart = Date.now();
+  running = true; paused = false;
+  restartCount = 0; failStreak = 0;
+  activeMs = 0; sessionStart = Date.now();
   await keepAwake();
   try{
     if(currentMode === "realtime"){
@@ -361,19 +453,47 @@ $("startBtn").onclick = async () => {
     return;
   }
   $("setup").open = false;
-  $("startBtn").style.display = "none";
-  $("stopBtn").style.display = "block";
+  showRunButtons();
+};
+
+$("pauseBtn").onclick = async () => {
+  if(!running) return;
+  if(!paused){
+    paused = true;
+    activeMs += Date.now() - sessionStart;
+    if(currentMode === "realtime") teardownRT(true);
+    else if(rec){ try{ rec.stop(); }catch(e){} }
+    $("pauseBtn").textContent = "▶ Продолжить";
+    setStatus(`Пауза — деньги не тратятся. Наслушано: ${costStr()}`);
+  } else {
+    sessionStart = Date.now();
+    try{
+      if(currentMode === "realtime"){ paused = false; await startRealtime(); tickStatus(); }
+      else{
+        paused = false;
+        if(!rec) rec = makeRec();
+        try{ rec.start(); }catch(e){}
+        setStatus("Слушаю (бесплатный режим)…");
+      }
+    }catch(e){
+      paused = true;
+      setStatus("Не удалось продолжить: " + e.message + " — жми ▶ ещё раз");
+      return;
+    }
+    $("pauseBtn").textContent = "⏸ Пауза";
+  }
 };
 
 $("stopBtn").onclick = () => {
-  running = false;
+  if(running && !paused) activeMs += Date.now() - sessionStart;
+  running = false; paused = false;
   clearInterval(costTimer);
   if(currentMode === "realtime") teardownRT(false);
   if(rec){ try{ rec.stop(); }catch(e){} rec = null; }
   if(wakeLock){ wakeLock.release(); wakeLock = null; }
-  $("startBtn").style.display = "block";
-  $("stopBtn").style.display = "none";
-  setStatus("Остановлено.");
+  showIdleButtons();
+  const s = Math.floor(activeMs/1000);
+  setStatus(`Остановлено. Всего перевода: ${Math.floor(s/60)} мин${currentMode==="realtime" ? `, потрачено ≈$${(s/60*PRICE_PER_MIN).toFixed(2)}` : ""}.`);
 };
 
 $("testBtn").onclick = async () => {
