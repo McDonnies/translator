@@ -7,11 +7,11 @@
 <style>
   body{font-family:system-ui,sans-serif;margin:0;padding:16px;background:#111;color:#eee}
   h3{margin:4px 0 12px}
-  input{width:100%;box-sizing:border-box;padding:10px;margin:4px 0;border-radius:8px;border:1px solid #444;background:#1c1c1c;color:#eee;font-size:14px}
+  input,select{width:100%;box-sizing:border-box;padding:10px;margin:4px 0;border-radius:8px;border:1px solid #444;background:#1c1c1c;color:#eee;font-size:14px}
   button{width:100%;padding:14px;margin-top:10px;border:none;border-radius:10px;font-size:17px;font-weight:600}
   #startBtn{background:#2e7d32;color:#fff}
   #stopBtn{background:#b71c1c;color:#fff;display:none}
-  #dlBtn{background:#333;color:#eee;font-size:14px;padding:10px}
+  #dlBtn,#testBtn{background:#333;color:#eee;font-size:14px;padding:10px}
   #status{margin:10px 0;font-size:13px;color:#9e9e9e;white-space:pre-line}
   #interim{color:#80cbc4;font-style:italic;min-height:1.4em;font-size:15px}
   .msg{background:#1e1e1e;border-radius:10px;padding:10px;margin:8px 0}
@@ -19,6 +19,8 @@
   .ru{font-size:16px;margin-top:4px}
   details{margin-bottom:10px}
   summary{cursor:pointer;color:#9e9e9e}
+  label.chk{display:flex;gap:8px;align-items:center;font-size:14px;margin:8px 0;color:#ccc}
+  label.chk input{width:auto;margin:0}
 </style>
 </head>
 <body>
@@ -26,10 +28,15 @@
 
 <details open id="setup">
   <summary>Настройки (сохраняются на телефоне)</summary>
-  <input id="oaKey" placeholder="OpenAI API key — НЕОБЯЗАТЕЛЬНО (пусто = бесплатный Google-перевод)" autocomplete="off">
+  <select id="mode">
+    <option value="realtime">🎯 OpenAI Realtime — лучшее качество, ~$2/час (нужен ключ)</option>
+    <option value="free">🆓 Бесплатный — Web Speech + Google (качество хуже)</option>
+  </select>
+  <input id="oaKey" placeholder="OpenAI API key (sk-...) — обязателен для Realtime" autocomplete="off">
   <input id="tgToken" placeholder="Telegram bot token (123456:ABC...)" autocomplete="off">
   <input id="tgChat" placeholder="Telegram chat id (-100...)" autocomplete="off">
-  <button id="testBtn" style="background:#333;color:#eee;font-size:14px;padding:10px">Проверить связь (пришлёт тест в телегу)</button>
+  <label class="chk"><input type="checkbox" id="playAudio" checked> 🔊 Озвучивать перевод — только в наушнике, иначе микрофон услышит сам себя</label>
+  <button id="testBtn">Проверить связь (пришлёт тест в телегу)</button>
 </details>
 
 <button id="startBtn">▶ Начать перевод</button>
@@ -38,20 +45,38 @@
 <div id="interim"></div>
 <div id="log"></div>
 <button id="dlBtn">⬇ Скачать транскрипт</button>
+<audio id="ttsOut" autoplay playsinline></audio>
 
 <script>
 const $ = id => document.getElementById(id);
-const fields = ["oaKey","tgToken","tgChat"];
-fields.forEach(f => {
-  $(f).value = localStorage.getItem(f) || "";
-  $(f).addEventListener("input", () => localStorage.setItem(f, $(f).value.trim()));
+const PRICE_PER_MIN = 0.034; // $ за минуту gpt-realtime-translate
+
+["oaKey","tgToken","tgChat","mode"].forEach(f => {
+  const el = $(f);
+  const savedVal = localStorage.getItem(f);
+  if(savedVal !== null) el.value = savedVal;
+  el.addEventListener("input", () => localStorage.setItem(f, el.value.trim()));
+  el.addEventListener("change", () => localStorage.setItem(f, el.value));
+});
+$("playAudio").checked = localStorage.getItem("playAudio") !== "0";
+$("playAudio").addEventListener("change", () => {
+  localStorage.setItem("playAudio", $("playAudio").checked ? "1" : "0");
+  $("ttsOut").muted = !$("playAudio").checked;
 });
 
 let running = false, rec = null, wakeLock = null;
 let transcript = [];
 let restartCount = 0;
+let currentMode = "realtime";
+let sessionStart = 0, costTimer = null;
 
 function setStatus(t){ $("status").textContent = t; }
+function tickStatus(){
+  if(!running || currentMode !== "realtime") return;
+  const s = Math.floor((Date.now() - sessionStart) / 1000);
+  const mm = String(Math.floor(s/60)).padStart(2,"0"), ss = String(s%60).padStart(2,"0");
+  setStatus(`Слушаю (Realtime)… ${mm}:${ss} · ≈$${(s/60*PRICE_PER_MIN).toFixed(2)} · переподключений: ${restartCount}`);
+}
 
 async function requestLock(){
   try {
@@ -70,9 +95,166 @@ async function keepAwake(){
   });
 }
 
+async function sendTG(text){
+  for(let i=0;i<3;i++){
+    try{
+      const r = await fetch(`https://api.telegram.org/bot${$("tgToken").value.trim()}/sendMessage`,{
+        method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({chat_id: $("tgChat").value.trim(), text})
+      });
+      if(r.status === 429){ await new Promise(s=>setTimeout(s,3000)); continue; }
+      if(!r.ok) throw new Error("TG " + r.status);
+      return true;
+    }catch(e){ await new Promise(s=>setTimeout(s,1500)); }
+  }
+  return false;
+}
+
+// общая очередь отправки в TG, чтобы фразы уходили по порядку
+const tgQueue = [];
+let tgBusy = false;
+async function pumpTG(){
+  if(tgBusy || !tgQueue.length) return;
+  tgBusy = true;
+  const item = tgQueue.shift();
+  if($("tgToken").value.trim() && $("tgChat").value.trim()){
+    const ok = await sendTG(item.text);
+    if(!ok && item.div) item.div.querySelector(".ru").textContent += "  ⚠️ не ушло в TG";
+  }
+  tgBusy = false;
+  pumpTG();
+}
+
+function addMsg(fr, ru){
+  const div = document.createElement("div");
+  div.className = "msg";
+  div.innerHTML = `<div class="fr"></div><div class="ru"></div>`;
+  div.querySelector(".fr").textContent = fr;
+  div.querySelector(".ru").textContent = ru;
+  $("log").prepend(div);
+  return div;
+}
+function pushSegment(fr, ru){
+  transcript.push({fr, ru});
+  const div = addMsg(fr, ru);
+  tgQueue.push({text: ru, div});
+  pumpTG();
+}
+
+/* ---------- Realtime-режим: gpt-realtime-translate по WebRTC ---------- */
+let pc = null, dc = null, mediaStream = null;
+let refreshTimer = null, flushTimer = null;
+let ruBuf = "", frBuf = "";
+let restarting = false, failStreak = 0;
+
+async function startRealtime(){
+  const key = $("oaKey").value.trim();
+  setStatus("Создаю Realtime-сессию…");
+  const cs = await fetch("https://api.openai.com/v1/realtime/translations/client_secrets", {
+    method: "POST",
+    headers: { Authorization: "Bearer " + key, "Content-Type": "application/json" },
+    body: JSON.stringify({ session: { model: "gpt-realtime-translate", audio: { output: { language: "ru" } } } })
+  });
+  if(!cs.ok) throw new Error("OpenAI " + cs.status + " — проверь ключ и баланс (нужен Tier 1+)");
+  const secret = (await cs.json()).value;
+
+  if(!mediaStream)
+    mediaStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+
+  pc = new RTCPeerConnection();
+  mediaStream.getAudioTracks().forEach(t => pc.addTrack(t, mediaStream));
+  pc.ontrack = ({streams}) => {
+    const a = $("ttsOut");
+    a.srcObject = streams[0];
+    a.muted = !$("playAudio").checked;
+    a.play().catch(()=>{});
+  };
+  dc = pc.createDataChannel("oai-events");
+  dc.onmessage = onRealtimeEvent;
+  pc.onconnectionstatechange = () => {
+    if(running && (pc.connectionState === "failed" || pc.connectionState === "disconnected")){
+      setStatus("Связь оборвалась — переподключаюсь…");
+      scheduleRestart();
+    }
+  };
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  const sdp = await fetch("https://api.openai.com/v1/realtime/translations/calls", {
+    method: "POST",
+    headers: { Authorization: "Bearer " + secret, "Content-Type": "application/sdp" },
+    body: offer.sdp
+  });
+  if(!sdp.ok) throw new Error("Не удалось установить соединение: " + sdp.status);
+  await pc.setRemoteDescription({ type: "answer", sdp: await sdp.text() });
+
+  failStreak = 0;
+  // у realtime-сессий есть лимит длительности — плановый перезапуск раньше, чем нас отрежут
+  clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(() => {
+    if(running){ setStatus("Плановое обновление сессии…"); scheduleRestart(); }
+  }, 25 * 60 * 1000);
+}
+
+function teardownRT(keepMic){
+  clearTimeout(refreshTimer);
+  flushSegment();
+  try{ dc && dc.close(); }catch(e){}
+  try{ pc && pc.close(); }catch(e){}
+  dc = pc = null;
+  if(!keepMic && mediaStream){ mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+}
+
+function scheduleRestart(){
+  if(restarting || !running) return;
+  restarting = true;
+  teardownRT(true); // микрофон не отпускаем, чтобы не потерять разрешение
+  restartCount++;
+  const delay = Math.min(15000, 1000 * Math.pow(2, failStreak));
+  setTimeout(async () => {
+    restarting = false;
+    if(!running) return;
+    try{ await startRealtime(); }
+    catch(e){
+      failStreak++;
+      setStatus("Переподключение не удалось: " + e.message + " — пробую снова…");
+      scheduleRestart();
+    }
+  }, delay);
+}
+
+function onRealtimeEvent({data}){
+  let e;
+  try{ e = JSON.parse(data); }catch(_){ return; }
+  if(e.type === "session.output_transcript.delta" && e.delta){
+    ruBuf += e.delta;
+    $("interim").textContent = ruBuf;
+    armFlush();
+  } else if(e.type === "session.input_transcript.delta" && e.delta){
+    frBuf += e.delta;
+  } else if(e.type === "error"){
+    setStatus("Ошибка API: " + (((e.error||{}).message) || JSON.stringify(e)).slice(0,140));
+  }
+}
+
+// сегментация: пауза 1.8с = конец фразы; длинный монолог режем по концу предложения
+function armFlush(){
+  clearTimeout(flushTimer);
+  if(ruBuf.length > 400 && /[.!?…]["»]?\s*$/.test(ruBuf)){ flushSegment(); return; }
+  flushTimer = setTimeout(flushSegment, 1800);
+}
+function flushSegment(){
+  clearTimeout(flushTimer);
+  const ru = ruBuf.trim(), fr = frBuf.trim();
+  ruBuf = ""; frBuf = "";
+  $("interim").textContent = "";
+  if(ru) pushSegment(fr, ru);
+}
+
+/* ---------- Бесплатный режим: Web Speech + перевод ---------- */
 async function translateFR(text){
   const key = $("oaKey").value.trim();
-  if(!key){  // бесплатный вариант: неофициальный эндпоинт Google Translate
+  if(!key){  // неофициальный эндпоинт Google Translate
     const u = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=fr&tl=ru&dt=t&q=" + encodeURIComponent(text);
     const r = await fetch(u);
     if(!r.ok) throw new Error("GoogleTr " + r.status);
@@ -96,49 +278,25 @@ async function translateFR(text){
   return j.choices[0].message.content.trim();
 }
 
-async function sendTG(text){
-  for(let i=0;i<3;i++){
-    try{
-      const r = await fetch(`https://api.telegram.org/bot${$("tgToken").value.trim()}/sendMessage`,{
-        method:"POST", headers:{"Content-Type":"application/json"},
-        body: JSON.stringify({chat_id: $("tgChat").value.trim(), text})
-      });
-      if(r.status === 429){ await new Promise(s=>setTimeout(s,3000)); continue; }
-      if(!r.ok) throw new Error("TG " + r.status);
-      return true;
-    }catch(e){ await new Promise(s=>setTimeout(s,1500)); }
-  }
-  return false;
-}
-
-// очередь, чтобы фразы уходили по порядку
 const q = [];
 let busy = false;
-async function pump(){
+async function pumpFree(){
   if(busy || !q.length) return;
   busy = true;
   const fr = q.shift();
   try{
     const ru = await translateFR(fr);
-    transcript.push({fr, ru});
-    const div = document.createElement("div");
-    div.className = "msg";
-    div.innerHTML = `<div class="fr"></div><div class="ru"></div>`;
-    div.querySelector(".fr").textContent = fr;
-    div.querySelector(".ru").textContent = ru;
-    $("log").prepend(div);
-    const ok = await sendTG(ru);
-    if(!ok) div.querySelector(".ru").textContent += "  ⚠️ не ушло в TG";
+    pushSegment(fr, ru);
   }catch(e){
     setStatus("Ошибка перевода: " + e.message + " (продолжаю слушать)");
   }
   busy = false;
-  pump();
+  pumpFree();
 }
 
 function makeRec(){
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if(!SR){ alert("Этот браузер не умеет распознавание речи. Открой в Chrome на Android."); return null; }
+  if(!SR){ alert("Этот браузер не умеет распознавание речи. Открой в Chrome на Android или выбери режим Realtime."); return null; }
   const r = new SR();
   r.lang = "fr-FR";
   r.continuous = true;
@@ -150,7 +308,7 @@ function makeRec(){
       const res = e.results[i];
       if(res.isFinal){
         const text = res[0].transcript.trim();
-        if(text.length > 1){ q.push(text); pump(); }
+        if(text.length > 1){ q.push(text); pumpFree(); }
       } else interim += res[0].transcript;
     }
     $("interim").textContent = interim;
@@ -158,35 +316,60 @@ function makeRec(){
   r.onend = () => {           // Chrome на Android периодически сам останавливается — перезапускаем
     if(running){
       restartCount++;
-      setStatus(`Слушаю… (перезапусков: ${restartCount})`);
+      setStatus(`Слушаю (бесплатный режим)… перезапусков: ${restartCount}`);
       try{ r.start(); }catch(e){ setTimeout(()=>{ try{r.start()}catch(_){} }, 500); }
     }
   };
   r.onerror = (e) => {
-    if(e.error === "not-allowed"){ setStatus("Нет доступа к микрофону! Разреши в настройках сайта."); running = false; }
+    if(e.error === "not-allowed"){
+      setStatus("Нет доступа к микрофону! Разреши в настройках сайта.");
+      running = false;
+      $("startBtn").style.display = "block";
+      $("stopBtn").style.display = "none";
+    }
     // остальные ошибки (no-speech, network) — onend сам перезапустит
   };
   return r;
 }
 
+/* ---------- Управление ---------- */
 $("startBtn").onclick = async () => {
-  if(!$("tgToken").value || !$("tgChat").value){
-    alert("Заполни token и chat_id телеги в настройках"); return;
+  currentMode = $("mode").value;
+  if(currentMode === "realtime" && !$("oaKey").value.trim()){
+    alert("Для Realtime нужен OpenAI API key. Впиши его или выбери бесплатный режим."); return;
   }
-  rec = makeRec();
-  if(!rec) return;
-  running = true; restartCount = 0;
+  if((!$("tgToken").value.trim() || !$("tgChat").value.trim()) &&
+     !confirm("Telegram не настроен — перевод будет только на экране. Продолжить?")) return;
+
+  running = true; restartCount = 0; failStreak = 0; sessionStart = Date.now();
   await keepAwake();
-  rec.start();
+  try{
+    if(currentMode === "realtime"){
+      await startRealtime();
+      clearInterval(costTimer);
+      costTimer = setInterval(tickStatus, 1000);
+      tickStatus();
+    } else {
+      rec = makeRec();
+      if(!rec){ running = false; return; }
+      rec.start();
+      setStatus("Слушаю (бесплатный режим)…");
+    }
+  }catch(e){
+    running = false;
+    setStatus("Не удалось запустить: " + e.message);
+    return;
+  }
   $("setup").open = false;
   $("startBtn").style.display = "none";
   $("stopBtn").style.display = "block";
-  setStatus("Слушаю…");
 };
 
 $("stopBtn").onclick = () => {
   running = false;
-  if(rec) rec.stop();
+  clearInterval(costTimer);
+  if(currentMode === "realtime") teardownRT(false);
+  if(rec){ try{ rec.stop(); }catch(e){} rec = null; }
   if(wakeLock){ wakeLock.release(); wakeLock = null; }
   $("startBtn").style.display = "block";
   $("stopBtn").style.display = "none";
