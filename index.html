@@ -241,7 +241,10 @@ async function startRealtime(){
   const secret = (await cs.json()).value;
 
   if(!mediaStream)
-    mediaStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+    // шумодав и эхоподавление душат дальнюю речь — выключаем, АРУ подтягивает тихих спикеров
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: true }
+    });
 
   pc = new RTCPeerConnection();
   mediaStream.getAudioTracks().forEach(t => pc.addTrack(t, mediaStream));
