@@ -321,11 +321,12 @@ function onRealtimeEvent({data}){
   }
 }
 
-// сегментация: пауза 1.8с = конец фразы; длинный монолог режем по концу предложения
+// сегментация: законченное предложение шлём быстро, незаконченное ждёт паузу подольше
 function armFlush(){
   clearTimeout(flushTimer);
-  if(ruBuf.length > 400 && /[.!?…]["»]?\s*$/.test(ruBuf)){ flushSegment(); return; }
-  flushTimer = setTimeout(flushSegment, 1800);
+  const endsSentence = /[.!?…]["»]?\s*$/.test(ruBuf);
+  if(ruBuf.length > 300 && endsSentence){ flushSegment(); return; }
+  flushTimer = setTimeout(flushSegment, endsSentence ? 800 : 1800);
 }
 function flushSegment(){
   clearTimeout(flushTimer);
